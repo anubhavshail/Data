@@ -10,10 +10,12 @@ from typing import List, Dict
 from config import config
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import cuid
+from datetime import datetime
 
 class UploadToDB:
     def __init__(self):
         self.setup_logging()
+        self.setup_directories()
         self.setup_connections()
         self.api_base_url = "https://taskar-api.medinos.in"
         self.setup_session()
@@ -35,7 +37,20 @@ class UploadToDB:
             aws_secret_access_key=config['aws']['aws_secret_access_key'],
             region_name=config['aws']['region_name']
         )
-        print("Connected to S3")
+    
+    def setup_directories(self):
+        self.processed_files_path = 'processed_files.txt'
+
+    def load_processed_files(self) -> set:
+        try:
+            with open(self.processed_files_path, 'r') as f:
+                return set(line.strip() for line in f)
+        except FileNotFoundError:
+            return set()
+    
+    def mark_file_as_processed(self, filename: str):
+        with open(self.processed_files_path, 'a') as f:
+            f.write(f"{filename}\n")
 
     def setup_session(self):
         self.session = requests.Session()
@@ -46,22 +61,20 @@ class UploadToDB:
     def upload_image_chunk(self, image_paths: List[str]) -> List[str]:
         try:
             files = []
-            print(f"Uploading {len(image_paths)} images to s3")
             
             if len(image_paths) <= 1: 
                 urls = ['https://medinos-backend.s3.amazonaws.com/uploads/1729321881992_medicine.png']
                 return urls
 
             for path in image_paths:
-                adjusted_path = Path('..').joinpath(path).resolve()
-                if os.path.exists(adjusted_path):
-                    file_name = os.path.basename(adjusted_path)
+                # adjusted_path = Path('..').joinpath(path).resolve()
+                if os.path.exists(path):
+                    file_name = os.path.basename(path)
                     files.append(
-                        ('files', (file_name, open(adjusted_path, 'rb'), 'image/jpeg'))
+                        ('files', (file_name, open(path, 'rb'), 'image/jpeg'))
                     )
                 else:
                     logging.warning(f"File not found: {path}")
-            print(files)
             response = self.session.post(
                 f"{self.api_base_url}/api/aws-s3/upload/multiple_files?type=image",
                 files=files
@@ -98,7 +111,6 @@ class UploadToDB:
             chunk_size = 5
             image_chunks = [image_paths[i:i + chunk_size] for i in range(0, len(image_paths), chunk_size) ]
             all_urls = []
-            print(f"image_chunks: {image_chunks}")
 
             with ThreadPoolExecutor(max_workers=3) as executor:
                 future_to_chunk = {
@@ -124,27 +136,36 @@ class UploadToDB:
         cursor = self.db_conn.cursor()
 
         try:
-            image_paths = med_data['file_paths']
-            print(image_paths)
+            image_paths = med_data['image_paths']
             if isinstance(image_paths, str):
                 image_paths = eval(image_paths)
-                print(image_paths)
 
             image_urls = self.upload_image_via_api(image_paths, med_data['medicine_name'])
-            print(image_urls)
 
-            print('image url')
             if not image_urls:
                 logging.warning(f"No image uploaded for {med_data['medicine_name']}")
-            
-            category_id = 'cm2fsk7130000du76q8wodi6y'
-            item_code = '0'
-            hsn_code = '0'
-            packaging_size = '0'
-            packaging_size_id = 'cm1c0iybi00003j6gnuanb0by'
 
-            print(med_data['marketer'])
+            category_id = 21
+            size = '1'
             marketer = med_data.get('marketer')
+            price = med_data.get('mrp')
+            discount = med_data.get('discount')
+            packaging_type = 'Box'
+            stock = 0
+
+            if price == 'N/A' or pd.isna(price) or price in None:
+                price = '0'
+            else:
+                price = float(price)
+
+            if discount == 'N/A' or pd.isna(discount) or discount in None:
+                discount = '0'
+            else:
+                discount = float(discount)
+    
+            id = cuid.cuid()
+            cursor.execute("""INSERT INTO "SizeGroups" (id) VALUES (%s) RETURNING id""", (id,))
+            sizeGroupId = cursor.fetchone()[0]
 
             cursor.execute("SELECT * FROM manufacturers WHERE name= %s", ([marketer]))
             manufacturer_row = cursor.fetchone()
@@ -156,23 +177,24 @@ class UploadToDB:
                 cursor.execute("""INSERT INTO manufacturers (id, name, address, email, "gstNo", "phoneNumber") VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""", (manufacturer_id, marketer, 'NA', 'NA', 'NA', 'NA'))
                 manufacturer_id = cursor.fetchone()[0]
             product_id = cuid.cuid()
+    
             cursor.execute("""
-                INSERT INTO products (id, item_name, category_id, hsn_code, item_code, item_salt, price, discount, description, image_url, manufacturer_id, packaging_size, packaging_size_id, is_prescription_required)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id """, (
+                INSERT INTO products ("itemCode", name, "categoryId", price, discount, description, "imageUrl", "manufacturerId", size, "sizeGroupId", "isPrescriptionRequired", "packagingType", stock, "updatedAt")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING "itemCode" """, (
                     product_id,
                     med_data['medicine_name'],
                     category_id,
-                    hsn_code,
-                    item_code,
-                    med_data['salt_composition'],
-                    float(med_data['mrp']),
-                    float(med_data['discount']),
+                    price,
+                    discount,
                     med_data['about'],
                     image_urls,
                     manufacturer_id,
-                    packaging_size,
-                    packaging_size_id,
-                    med_data['is_prescription_required']
+                    size,
+                    sizeGroupId,
+                    med_data['is_prescription_required'],
+                    packaging_type,
+                    stock,
+                    datetime.now()
                 ))
 
             product_id = cursor.fetchone()[0]
@@ -192,27 +214,59 @@ class UploadToDB:
             df = pd.read_csv(csv_file)
             total_products = len(df)
             successful_uploads = 0
+            failed_products = []
 
             for index, row in df.iterrows():
                 logging.info(f"Processing product {index + 1} of {total_products}")
-                product_id = self.insert_product(row.to_dict())
+                try:
+                    product_id = self.insert_product(row.to_dict())
 
-                if product_id:
-                    successful_uploads +=1
-                    logging.info(f"Progress: {successful_uploads}/{total_products} products processed")
+                    if product_id:
+                        successful_uploads +=1
+                        logging.info(f"Progress: {successful_uploads}/{total_products} products processed")
+                    else:
+                        failed_products.append(row['medicine_name'])
+                except Exception as e:
+                    failed_products.append(row['medicine_name'])
+                    logging.error(f"Error processing product {row['medicine_name']}: {str(e)}")
+                    continue
             
-            logging.info(f"Completed processing {csv_file}. Successfully uploaded {successful_uploads} out of {total_products} products")
+            logging.info(f"Completed processing {csv_file}") 
+            logging.info(f"Successfully uploaded {successful_uploads} out of {total_products} products")
+
+            if failed_products:
+                failed_file = f"failed_{os.path.basename(csv_file)}"
+                df[df['medicine_name'].isin(failed_products)].to_csv(failed_file, index=False)
+                logging.info(f"Failed products saved to {failed_file}")
+
+            if successful_uploads == total_products:
+                return True
+            return False
 
         except Exception as e:
             logging.error(f"Error processing {csv_file}: {str(e)}")
+            return False
 
     def run(self):
         try:
-            csv_dir = Path('../medicine_info')
+            csv_dir = Path('medicine_info')
             csv_files = list(csv_dir.glob('*.csv'))
+            processed_files = self.load_processed_files()
 
             for csv_file in csv_files:
-                self.process_csv_file(str(csv_file))
+                csv_path = str(csv_file)
+                if csv_path in processed_files:
+                    logging.info(f"Skipping {csv_file} as already processed")
+                    continue
+
+                logging.info(f"Processing new file {csv_path}")
+                try:
+                    self.process_csv_file(csv_path)
+                    self.mark_file_as_processed(csv_path)
+                    logging.info(f"Marked {csv_path} as processed")
+                except Exception as e:
+                    logging.error(f"Error processing {csv_file}: {str(e)}")
+                    continue
             
         finally:
             self.db_conn.close()
